@@ -271,29 +271,355 @@ cmd_proxy() {
     fi
 }
 
+cmd_export() {
+    load_config
+    local domain="${1:-}"
+    local format="${2:-json}"
+    
+    if [[ -z "$domain" ]]; then
+        echo "Usage: cf export <domain> [json|bind]"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$domain")
+    local result=$(cf_api GET "/zones/$zone_id/dns_records?per_page=1000")
+    
+    if [[ "$format" == "bind" ]]; then
+        # Export in BIND zone file format
+        echo "; DNS records for $domain"
+        echo "; Exported $(date -u +"%Y-%m-%d %H:%M:%S UTC")"
+        echo ""
+        echo "$result" | jq -r '.result[] | 
+            if .type == "MX" then
+                "\(.name).\t\(.ttl)\tIN\t\(.type)\t\(.priority)\t\(.content)."
+            elif .type == "CNAME" or .type == "NS" then
+                "\(.name).\t\(.ttl)\tIN\t\(.type)\t\(.content)."
+            elif .type == "TXT" then
+                "\(.name).\t\(.ttl)\tIN\t\(.type)\t\"\(.content)\""
+            else
+                "\(.name).\t\(.ttl)\tIN\t\(.type)\t\(.content)"
+            end'
+    else
+        # Export as JSON (default)
+        echo "$result" | jq '[.result[] | {type, name, content, ttl, proxied, priority}]'
+    fi
+}
+
+cmd_import() {
+    load_config
+    local domain="${1:-}"
+    local file="${2:-}"
+    
+    if [[ -z "$domain" || -z "$file" ]]; then
+        echo "Usage: cf import <domain> <file.json>"
+        echo ""
+        echo "JSON format:"
+        echo '  [{"type": "A", "name": "sub.example.com", "content": "1.2.3.4", "proxied": false}]'
+        exit 1
+    fi
+    
+    if [[ ! -f "$file" ]]; then
+        echo -e "${RED}File not found: $file${NC}"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$domain")
+    local records=$(cat "$file")
+    local count=$(echo "$records" | jq length)
+    
+    echo -e "${BLUE}Importing $count records to $domain...${NC}"
+    
+    echo "$records" | jq -c '.[]' | while read -r record; do
+        local type=$(echo "$record" | jq -r '.type')
+        local name=$(echo "$record" | jq -r '.name')
+        local content=$(echo "$record" | jq -r '.content')
+        local proxied=$(echo "$record" | jq -r '.proxied // false')
+        local ttl=$(echo "$record" | jq -r '.ttl // 1')
+        local priority=$(echo "$record" | jq -r '.priority // null')
+        
+        local data
+        if [[ "$priority" != "null" ]]; then
+            data=$(jq -n \
+                --arg type "$type" \
+                --arg name "$name" \
+                --arg content "$content" \
+                --argjson proxied "$proxied" \
+                --argjson ttl "$ttl" \
+                --argjson priority "$priority" \
+                '{type: $type, name: $name, content: $content, proxied: $proxied, ttl: $ttl, priority: $priority}')
+        else
+            data=$(jq -n \
+                --arg type "$type" \
+                --arg name "$name" \
+                --arg content "$content" \
+                --argjson proxied "$proxied" \
+                --argjson ttl "$ttl" \
+                '{type: $type, name: $name, content: $content, proxied: $proxied, ttl: $ttl}')
+        fi
+        
+        local result=$(cf_api POST "/zones/$zone_id/dns_records" -d "$data")
+        
+        if [[ $(echo "$result" | jq -r '.success') == "true" ]]; then
+            echo -e "${GREEN}✓${NC} $type $name → $content"
+        else
+            local error=$(echo "$result" | jq -r '.errors[0].message // "Unknown error"')
+            echo -e "${RED}✗${NC} $type $name: $error"
+        fi
+    done
+}
+
+cmd_purge() {
+    load_config
+    local domain="${1:-}"
+    local target="${2:-all}"
+    
+    if [[ -z "$domain" ]]; then
+        echo "Usage: cf purge <domain> [all|url1 url2 ...]"
+        echo ""
+        echo "Examples:"
+        echo "  cf purge example.com              # Purge everything"
+        echo "  cf purge example.com /page.html   # Purge specific URLs"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$domain")
+    local data
+    local result
+    
+    if [[ "$target" == "all" ]]; then
+        data='{"purge_everything": true}'
+        echo -e "${YELLOW}Purging all cached content for $domain...${NC}"
+    else
+        shift
+        local urls=("$@")
+        data=$(jq -n --argjson urls "$(printf '%s\n' "${urls[@]}" | jq -R . | jq -s .)" '{files: $urls}')
+        echo -e "${YELLOW}Purging ${#urls[@]} URLs...${NC}"
+    fi
+    
+    result=$(cf_api POST "/zones/$zone_id/purge_cache" -d "$data")
+    
+    if [[ $(echo "$result" | jq -r '.success') == "true" ]]; then
+        echo -e "${GREEN}✓ Cache purged successfully${NC}"
+    else
+        echo -e "${RED}Error:${NC}"
+        echo "$result" | jq -r '.errors[].message'
+        exit 1
+    fi
+}
+
+cmd_ssl() {
+    load_config
+    local domain="${1:-}"
+    
+    if [[ -z "$domain" ]]; then
+        echo "Usage: cf ssl <domain>"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$domain")
+    
+    # Get SSL settings
+    local ssl_result=$(cf_api GET "/zones/$zone_id/settings/ssl")
+    local ssl_mode=$(echo "$ssl_result" | jq -r '.result.value')
+    
+    # Get certificate packs
+    local certs_result=$(cf_api GET "/zones/$zone_id/ssl/certificate_packs?status=active")
+    
+    echo -e "${BLUE}SSL Status for $domain${NC}"
+    echo ""
+    echo -e "SSL Mode:    ${GREEN}$ssl_mode${NC}"
+    echo ""
+    echo "Certificate Packs:"
+    echo "$certs_result" | jq -r '.result[] | "  Type: \(.type)\n  Status: \(.status)\n  Hosts: \(.hosts | join(", "))\n  Expires: \(.certificates[0].expires_on // "N/A")\n"'
+    
+    # Get Universal SSL status
+    local universal=$(cf_api GET "/zones/$zone_id/ssl/universal/settings")
+    local universal_enabled=$(echo "$universal" | jq -r '.result.enabled')
+    echo -e "Universal SSL: $([[ "$universal_enabled" == "true" ]] && echo "${GREEN}enabled${NC}" || echo "${YELLOW}disabled${NC}")"
+}
+
+cmd_dev_mode() {
+    load_config
+    local domain="${1:-}"
+    local state="${2:-}"
+    
+    if [[ -z "$domain" || -z "$state" ]]; then
+        echo "Usage: cf dev-mode <domain> <on|off>"
+        echo ""
+        echo "Development mode temporarily disables caching (3 hours)"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$domain")
+    local value=$([[ "$state" == "on" ]] && echo "on" || echo "off")
+    
+    local data=$(jq -n --arg value "$value" '{value: $value}')
+    local result=$(cf_api PATCH "/zones/$zone_id/settings/development_mode" -d "$data")
+    
+    if [[ $(echo "$result" | jq -r '.success') == "true" ]]; then
+        if [[ "$value" == "on" ]]; then
+            local remaining=$(echo "$result" | jq -r '.result.time_remaining')
+            echo -e "${GREEN}✓ Development mode ON${NC} (expires in ${remaining}s)"
+        else
+            echo -e "${GREEN}✓ Development mode OFF${NC}"
+        fi
+    else
+        echo -e "${RED}Error:${NC}"
+        echo "$result" | jq -r '.errors[].message'
+        exit 1
+    fi
+}
+
+cmd_search() {
+    load_config
+    local pattern="${1:-}"
+    
+    if [[ -z "$pattern" ]]; then
+        echo "Usage: cf search <pattern>"
+        echo ""
+        echo "Search across all zones for matching records"
+        exit 1
+    fi
+    
+    echo -e "${BLUE}Searching for '$pattern' across all zones...${NC}"
+    echo ""
+    
+    local zones=$(cf_api GET "/zones?per_page=50" | jq -r '.result[] | "\(.id)\t\(.name)"')
+    local found=0
+    
+    while IFS=$'\t' read -r zone_id zone_name; do
+        local records=$(cf_api GET "/zones/$zone_id/dns_records?per_page=1000")
+        local matches=$(echo "$records" | jq -r --arg pattern "$pattern" '
+            .result[] | select(.name | test($pattern; "i")) or select(.content | test($pattern; "i")) |
+            "\(.type)\t\(.name)\t\(.content)"')
+        
+        if [[ -n "$matches" ]]; then
+            echo -e "${GREEN}[$zone_name]${NC}"
+            echo "$matches" | while IFS=$'\t' read -r type name content; do
+                printf "  %-6s %-40s %s\n" "$type" "$name" "$content"
+            done
+            echo ""
+            found=1
+        fi
+    done <<< "$zones"
+    
+    if [[ $found -eq 0 ]]; then
+        echo -e "${YELLOW}No records found matching '$pattern'${NC}"
+    fi
+}
+
+cmd_ttl() {
+    load_config
+    local name="${1:-}"
+    local ttl="${2:-}"
+    local type="${3:-A}"
+    
+    if [[ -z "$name" || -z "$ttl" ]]; then
+        echo "Usage: cf ttl <name> <ttl> [type]"
+        echo ""
+        echo "TTL values: 1 (auto), 60, 120, 300, 600, 900, 1800, 3600, ..."
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$name")
+    local result=$(cf_api GET "/zones/$zone_id/dns_records?name=$name&type=$type")
+    local record=$(echo "$result" | jq '.result[0]')
+    local record_id=$(echo "$record" | jq -r '.id // empty')
+    
+    if [[ -z "$record_id" ]]; then
+        echo -e "${RED}No $type record found for $name${NC}"
+        exit 1
+    fi
+    
+    local data=$(echo "$record" | jq --argjson ttl "$ttl" '. + {ttl: $ttl}')
+    local update_result=$(cf_api PUT "/zones/$zone_id/dns_records/$record_id" -d "$data")
+    
+    if [[ $(echo "$update_result" | jq -r '.success') == "true" ]]; then
+        local display_ttl=$([[ "$ttl" == "1" ]] && echo "Auto" || echo "${ttl}s")
+        echo -e "${GREEN}✓ TTL set to $display_ttl for $name${NC}"
+    else
+        echo -e "${RED}Error:${NC}"
+        echo "$update_result" | jq -r '.errors[].message'
+        exit 1
+    fi
+}
+
+cmd_status() {
+    load_config
+    local domain="${1:-}"
+    
+    if [[ -z "$domain" ]]; then
+        echo "Usage: cf status <domain>"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$domain")
+    local zone=$(cf_api GET "/zones/$zone_id")
+    
+    local status=$(echo "$zone" | jq -r '.result.status')
+    local paused=$(echo "$zone" | jq -r '.result.paused')
+    local name_servers=$(echo "$zone" | jq -r '.result.name_servers | join(", ")')
+    local plan=$(echo "$zone" | jq -r '.result.plan.name')
+    
+    echo -e "${BLUE}Zone Status: $domain${NC}"
+    echo ""
+    echo -e "Status:       $([[ "$status" == "active" ]] && echo "${GREEN}$status${NC}" || echo "${YELLOW}$status${NC}")"
+    echo -e "Paused:       $([[ "$paused" == "false" ]] && echo "${GREEN}no${NC}" || echo "${RED}yes${NC}")"
+    echo -e "Plan:         $plan"
+    echo -e "Nameservers:  $name_servers"
+    
+    # Get some quick settings
+    local settings=$(cf_api GET "/zones/$zone_id/settings")
+    local ssl=$(echo "$settings" | jq -r '.result[] | select(.id=="ssl") | .value')
+    local min_tls=$(echo "$settings" | jq -r '.result[] | select(.id=="min_tls_version") | .value')
+    local dev_mode=$(echo "$settings" | jq -r '.result[] | select(.id=="development_mode") | .value')
+    
+    echo ""
+    echo -e "SSL Mode:     $ssl"
+    echo -e "Min TLS:      $min_tls"
+    echo -e "Dev Mode:     $([[ "$dev_mode" == "on" ]] && echo "${YELLOW}on${NC}" || echo "off")"
+}
+
 cmd_help() {
     echo -e "${BLUE}cf${NC} - Cloudflare DNS CLI"
     echo ""
-    echo "Commands:"
-    echo "  init              Setup API token"
-    echo "  zones             List all zones"
-    echo "  list <domain>     List DNS records"
+    echo -e "${GREEN}DNS Records:${NC}"
+    echo "  list <domain>          List DNS records"
     echo "  add <type> <name> <content> [proxied]"
-    echo "                    Add a DNS record"
+    echo "                         Add a DNS record"
     echo "  update <name> <content> [type]"
-    echo "                    Update a DNS record"
-    echo "  delete <name> [type]"
-    echo "                    Delete DNS record(s)"
-    echo "  proxy <name> <on|off>"
-    echo "                    Toggle Cloudflare proxy"
+    echo "                         Update a DNS record"
+    echo "  delete <name> [type]   Delete DNS record(s)"
+    echo "  proxy <name> <on|off>  Toggle Cloudflare proxy"
+    echo "  ttl <name> <ttl> [type]"
+    echo "                         Update TTL (1=auto)"
+    echo "  search <pattern>       Search records across all zones"
     echo ""
-    echo "Examples:"
-    echo "  cf add A staging.dehouse.gg 1.2.3.4"
-    echo "  cf add A staging.dehouse.gg 1.2.3.4 true  # with proxy"
-    echo "  cf list dehouse.gg"
-    echo "  cf update staging.dehouse.gg 5.6.7.8"
-    echo "  cf delete staging.dehouse.gg A"
-    echo "  cf proxy staging.dehouse.gg on"
+    echo -e "${GREEN}Backup & Restore:${NC}"
+    echo "  export <domain> [json|bind]"
+    echo "                         Export records to stdout"
+    echo "  import <domain> <file.json>"
+    echo "                         Import records from JSON file"
+    echo ""
+    echo -e "${GREEN}Zone Management:${NC}"
+    echo "  zones                  List all zones"
+    echo "  status <domain>        Show zone status & settings"
+    echo "  purge <domain> [urls]  Purge cache (all or specific URLs)"
+    echo "  dev-mode <domain> <on|off>"
+    echo "                         Toggle development mode"
+    echo "  ssl <domain>           Show SSL certificate status"
+    echo ""
+    echo -e "${GREEN}Setup:${NC}"
+    echo "  init                   Configure API token"
+    echo ""
+    echo -e "${YELLOW}Examples:${NC}"
+    echo "  cf add A staging.example.com 1.2.3.4 true"
+    echo "  cf list example.com"
+    echo "  cf export example.com > backup.json"
+    echo "  cf import example.com backup.json"
+    echo "  cf purge example.com"
+    echo "  cf dev-mode example.com on"
+    echo "  cf search staging"
 }
 
 # Main
@@ -305,6 +631,14 @@ case "${1:-help}" in
     delete|rm) shift; cmd_delete "$@" ;;
     update) shift; cmd_update "$@" ;;
     proxy)  shift; cmd_proxy "$@" ;;
+    export) shift; cmd_export "$@" ;;
+    import) shift; cmd_import "$@" ;;
+    purge)  shift; cmd_purge "$@" ;;
+    ssl)    shift; cmd_ssl "$@" ;;
+    dev-mode|dev) shift; cmd_dev_mode "$@" ;;
+    search|find) shift; cmd_search "$@" ;;
+    ttl)    shift; cmd_ttl "$@" ;;
+    status) shift; cmd_status "$@" ;;
     help|--help|-h) cmd_help ;;
     *)
         echo -e "${RED}Unknown command: $1${NC}"
