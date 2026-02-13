@@ -1,0 +1,314 @@
+#!/usr/bin/env bash
+# cf - Simple Cloudflare DNS CLI
+# Usage: cf <command> [args]
+
+set -euo pipefail
+
+# Config file location
+CONFIG_FILE="${CF_CONFIG:-$HOME/.config/cf/config}"
+
+# Colors
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m'
+
+# Load config
+load_config() {
+    if [[ -f "$CONFIG_FILE" ]]; then
+        source "$CONFIG_FILE"
+    fi
+    
+    if [[ -z "${CF_API_TOKEN:-}" ]]; then
+        echo -e "${RED}Error: CF_API_TOKEN not set${NC}"
+        echo "Run: cf init"
+        exit 1
+    fi
+}
+
+# API helper
+cf_api() {
+    local method="$1"
+    local endpoint="$2"
+    shift 2
+    
+    curl -sS -X "$method" \
+        "https://api.cloudflare.com/client/v4$endpoint" \
+        -H "Authorization: Bearer $CF_API_TOKEN" \
+        -H "Content-Type: application/json" \
+        "$@"
+}
+
+# Get zone ID from domain name
+get_zone_id() {
+    local domain="$1"
+    # Extract root domain (last two parts)
+    local root_domain=$(echo "$domain" | awk -F. '{print $(NF-1)"."$NF}')
+    
+    local result=$(cf_api GET "/zones?name=$root_domain")
+    local zone_id=$(echo "$result" | jq -r '.result[0].id // empty')
+    
+    if [[ -z "$zone_id" ]]; then
+        echo -e "${RED}Error: Zone not found for $root_domain${NC}" >&2
+        exit 1
+    fi
+    
+    echo "$zone_id"
+}
+
+# Commands
+cmd_init() {
+    echo -e "${BLUE}Cloudflare DNS CLI Setup${NC}"
+    echo ""
+    
+    mkdir -p "$(dirname "$CONFIG_FILE")"
+    
+    read -rp "Cloudflare API Token: " token
+    
+    # Test the token
+    local result=$(curl -sS "https://api.cloudflare.com/client/v4/user/tokens/verify" \
+        -H "Authorization: Bearer $token")
+    
+    if [[ $(echo "$result" | jq -r '.success') != "true" ]]; then
+        echo -e "${RED}Invalid token${NC}"
+        exit 1
+    fi
+    
+    echo "CF_API_TOKEN=\"$token\"" > "$CONFIG_FILE"
+    chmod 600 "$CONFIG_FILE"
+    
+    echo -e "${GREEN}✓ Config saved to $CONFIG_FILE${NC}"
+}
+
+cmd_zones() {
+    load_config
+    
+    local result=$(cf_api GET "/zones?per_page=50")
+    
+    echo -e "${BLUE}Your Zones:${NC}"
+    echo "$result" | jq -r '.result[] | "\(.name)\t\(.id)"' | column -t
+}
+
+cmd_list() {
+    load_config
+    local domain="${1:-}"
+    
+    if [[ -z "$domain" ]]; then
+        echo "Usage: cf list <domain>"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$domain")
+    local result=$(cf_api GET "/zones/$zone_id/dns_records?per_page=100")
+    
+    echo -e "${BLUE}DNS Records for $domain:${NC}"
+    echo ""
+    printf "%-6s %-40s %-20s %s\n" "TYPE" "NAME" "CONTENT" "PROXY"
+    echo "─────────────────────────────────────────────────────────────────────────────────"
+    echo "$result" | jq -r '.result[] | "\(.type)\t\(.name)\t\(.content)\t\(.proxied)"' | \
+        while IFS=$'\t' read -r type name content proxied; do
+            proxy_icon=$([[ "$proxied" == "true" ]] && echo "🟠" || echo "⚪")
+            printf "%-6s %-40s %-20s %s\n" "$type" "$name" "${content:0:20}" "$proxy_icon"
+        done
+}
+
+cmd_add() {
+    load_config
+    local type="${1:-}"
+    local name="${2:-}"
+    local content="${3:-}"
+    local proxied="${4:-false}"
+    
+    if [[ -z "$type" || -z "$name" || -z "$content" ]]; then
+        echo "Usage: cf add <type> <name> <content> [proxied]"
+        echo ""
+        echo "Examples:"
+        echo "  cf add A staging.example.com 1.2.3.4"
+        echo "  cf add A staging.example.com 1.2.3.4 true"
+        echo "  cf add CNAME www.example.com example.com"
+        echo "  cf add TXT example.com \"v=spf1 include:_spf.google.com ~all\""
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$name")
+    
+    local data=$(jq -n \
+        --arg type "$type" \
+        --arg name "$name" \
+        --arg content "$content" \
+        --argjson proxied "$proxied" \
+        '{type: $type, name: $name, content: $content, proxied: $proxied, ttl: 1}')
+    
+    local result=$(cf_api POST "/zones/$zone_id/dns_records" -d "$data")
+    
+    if [[ $(echo "$result" | jq -r '.success') == "true" ]]; then
+        echo -e "${GREEN}✓ Created $type record: $name → $content${NC}"
+    else
+        echo -e "${RED}Error:${NC}"
+        echo "$result" | jq -r '.errors[].message'
+        exit 1
+    fi
+}
+
+cmd_delete() {
+    load_config
+    local name="${1:-}"
+    local type="${2:-}"
+    
+    if [[ -z "$name" ]]; then
+        echo "Usage: cf delete <name> [type]"
+        echo "  If type is omitted, deletes all records for that name"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$name")
+    
+    local filter="name=$name"
+    [[ -n "$type" ]] && filter="$filter&type=$type"
+    
+    local result=$(cf_api GET "/zones/$zone_id/dns_records?$filter")
+    local records=$(echo "$result" | jq -r '.result[] | "\(.id)\t\(.type)\t\(.content)"')
+    
+    if [[ -z "$records" ]]; then
+        echo -e "${YELLOW}No records found for $name${NC}"
+        exit 0
+    fi
+    
+    echo -e "${YELLOW}Records to delete:${NC}"
+    echo "$records" | while IFS=$'\t' read -r id rtype content; do
+        echo "  $rtype → $content"
+    done
+    
+    read -rp "Delete these records? [y/N] " confirm
+    if [[ "$confirm" != "y" && "$confirm" != "Y" ]]; then
+        echo "Aborted"
+        exit 0
+    fi
+    
+    echo "$records" | while IFS=$'\t' read -r id rtype content; do
+        cf_api DELETE "/zones/$zone_id/dns_records/$id" > /dev/null
+        echo -e "${GREEN}✓ Deleted $rtype record${NC}"
+    done
+}
+
+cmd_update() {
+    load_config
+    local name="${1:-}"
+    local content="${2:-}"
+    local type="${3:-A}"
+    
+    if [[ -z "$name" || -z "$content" ]]; then
+        echo "Usage: cf update <name> <new-content> [type]"
+        echo ""
+        echo "Examples:"
+        echo "  cf update staging.example.com 5.6.7.8"
+        echo "  cf update staging.example.com 5.6.7.8 A"
+        exit 1
+    fi
+    
+    local zone_id=$(get_zone_id "$name")
+    
+    # Find the record
+    local result=$(cf_api GET "/zones/$zone_id/dns_records?name=$name&type=$type")
+    local record_id=$(echo "$result" | jq -r '.result[0].id // empty')
+    local proxied=$(echo "$result" | jq -r '.result[0].proxied // false')
+    
+    if [[ -z "$record_id" ]]; then
+        echo -e "${RED}No $type record found for $name${NC}"
+        exit 1
+    fi
+    
+    local data=$(jq -n \
+        --arg type "$type" \
+        --arg name "$name" \
+        --arg content "$content" \
+        --argjson proxied "$proxied" \
+        '{type: $type, name: $name, content: $content, proxied: $proxied, ttl: 1}')
+    
+    local update_result=$(cf_api PUT "/zones/$zone_id/dns_records/$record_id" -d "$data")
+    
+    if [[ $(echo "$update_result" | jq -r '.success') == "true" ]]; then
+        echo -e "${GREEN}✓ Updated $type record: $name → $content${NC}"
+    else
+        echo -e "${RED}Error:${NC}"
+        echo "$update_result" | jq -r '.errors[].message'
+        exit 1
+    fi
+}
+
+cmd_proxy() {
+    load_config
+    local name="${1:-}"
+    local state="${2:-}"
+    
+    if [[ -z "$name" || -z "$state" ]]; then
+        echo "Usage: cf proxy <name> <on|off>"
+        exit 1
+    fi
+    
+    local proxied=$([[ "$state" == "on" ]] && echo "true" || echo "false")
+    local zone_id=$(get_zone_id "$name")
+    
+    local result=$(cf_api GET "/zones/$zone_id/dns_records?name=$name")
+    local record=$(echo "$result" | jq '.result[0]')
+    local record_id=$(echo "$record" | jq -r '.id // empty')
+    
+    if [[ -z "$record_id" ]]; then
+        echo -e "${RED}No record found for $name${NC}"
+        exit 1
+    fi
+    
+    local data=$(echo "$record" | jq --argjson proxied "$proxied" '. + {proxied: $proxied}')
+    local update_result=$(cf_api PUT "/zones/$zone_id/dns_records/$record_id" -d "$data")
+    
+    if [[ $(echo "$update_result" | jq -r '.success') == "true" ]]; then
+        echo -e "${GREEN}✓ Proxy $state for $name${NC}"
+    else
+        echo -e "${RED}Error:${NC}"
+        echo "$update_result" | jq -r '.errors[].message'
+        exit 1
+    fi
+}
+
+cmd_help() {
+    echo -e "${BLUE}cf${NC} - Cloudflare DNS CLI"
+    echo ""
+    echo "Commands:"
+    echo "  init              Setup API token"
+    echo "  zones             List all zones"
+    echo "  list <domain>     List DNS records"
+    echo "  add <type> <name> <content> [proxied]"
+    echo "                    Add a DNS record"
+    echo "  update <name> <content> [type]"
+    echo "                    Update a DNS record"
+    echo "  delete <name> [type]"
+    echo "                    Delete DNS record(s)"
+    echo "  proxy <name> <on|off>"
+    echo "                    Toggle Cloudflare proxy"
+    echo ""
+    echo "Examples:"
+    echo "  cf add A staging.dehouse.gg 1.2.3.4"
+    echo "  cf add A staging.dehouse.gg 1.2.3.4 true  # with proxy"
+    echo "  cf list dehouse.gg"
+    echo "  cf update staging.dehouse.gg 5.6.7.8"
+    echo "  cf delete staging.dehouse.gg A"
+    echo "  cf proxy staging.dehouse.gg on"
+}
+
+# Main
+case "${1:-help}" in
+    init)   cmd_init ;;
+    zones)  cmd_zones ;;
+    list|ls) shift; cmd_list "$@" ;;
+    add)    shift; cmd_add "$@" ;;
+    delete|rm) shift; cmd_delete "$@" ;;
+    update) shift; cmd_update "$@" ;;
+    proxy)  shift; cmd_proxy "$@" ;;
+    help|--help|-h) cmd_help ;;
+    *)
+        echo -e "${RED}Unknown command: $1${NC}"
+        cmd_help
+        exit 1
+        ;;
+esac
