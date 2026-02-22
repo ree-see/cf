@@ -21,11 +21,19 @@ cf init
 
 ## Usage
 
+### Global Flags
+
+```bash
+--dry-run, -n   Show what would happen without making changes
+--json, -j      Output raw JSON (works with list, zones)
+```
+
 ### DNS Records
 
 ```bash
 # List all records for a domain
 cf list example.com
+cf --json list example.com | jq length
 
 # Add records
 cf add A staging.example.com 1.2.3.4
@@ -41,6 +49,7 @@ cf update staging.example.com 5.6.7.8 A
 # Delete records
 cf delete staging.example.com        # all records for name
 cf delete staging.example.com A      # specific type
+cf --dry-run delete staging.example.com  # preview what would be deleted
 
 # Toggle Cloudflare proxy (orange cloud)
 cf proxy staging.example.com on
@@ -66,6 +75,14 @@ cf export example.com bind > zone.txt
 
 # Import from JSON
 cf import example.com backup.json
+cf --dry-run import example.com backup.json  # preview imports
+
+# Clone all records from one zone to another
+cf clone source.com target.com
+cf --dry-run clone source.com target.com     # preview clone
+
+# Diff live records against a backup
+cf diff example.com backup.json
 ```
 
 ### Zone Management
@@ -73,6 +90,7 @@ cf import example.com backup.json
 ```bash
 # List all your zones
 cf zones
+cf --json zones | jq '.[0].name'
 
 # Show zone status and settings
 cf status example.com
