@@ -66,7 +66,7 @@ get_zone_id() {
     IFS='.' read -ra parts <<< "$domain"
     local n=${#parts[@]}
     # Try 2-part suffix first, then 3, then 4 (handles .co.uk, .com.au, etc.)
-    for ((len=2; len<=4 && len<n; len++)); do
+    for ((len=2; len<=4 && len<=n; len++)); do
         local candidate
         candidate=$(IFS='.'; echo "${parts[*]: -$len}")
         local result zone_id
